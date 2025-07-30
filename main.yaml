@@ -1,0 +1,122 @@
+---
+- name: Install and Configure Single-Node Kubernetes Cluster
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    pod_network_cidr: "192.168.0.0/16" # Default for Calico
+    skip_apt_lock_check: true # Skip the APT lock check that causes timeouts
+
+  pre_tasks:
+  - name: Check if running with sufficient privileges
+    fail:
+      msg: "This playbook must be run as root or with sudo"
+    when: ansible_user_id != 'root' and not ansible_become
+    ignore_errors: no
+
+  - name: Include variables from cloud-init or environment
+    include_vars: "{{ item }}"
+    with_first_found:
+    - "{{ playbook_dir }}/runtime_vars.yaml"
+    - "{{ playbook_dir }}/group_vars/all.yaml"
+    ignore_errors: true
+
+  - name: Force remove apt locks
+    shell: |
+      rm -f /var/lib/apt/lists/lock
+      rm -f /var/lib/dpkg/lock
+      rm -f /var/lib/dpkg/lock-frontend
+      rm -f /var/cache/apt/archives/lock
+      rm -f /var/lib/dpkg/updates/*
+      rm -f /var/lib/dpkg/triggers/*
+      dpkg --configure -a
+      echo "APT locks cleared"
+    changed_when: false
+
+  - name: Stop and mask automatic update services
+    systemd:
+      name: "{{ item }}"
+      state: stopped
+      masked: yes
+    with_items:
+    - apt-daily.service
+    - apt-daily-upgrade.service
+    - unattended-upgrades.service
+    ignore_errors: yes
+
+  - name: Create empty lock files with permissive permissions
+    file:
+      path: "{{ item }}"
+      state: touch
+      mode: '0666'
+    with_items:
+    - /var/lib/dpkg/lock
+    - /var/lib/apt/lists/lock
+    - /var/lib/dpkg/lock-frontend
+    ignore_errors: yes
+
+  - name: Display playbook variables
+    debug:
+      msg:
+      - "Node name: {{ node_name | default('not set') }}"
+      - "Kubernetes version: {{ kubernetes_version | default('not set') }}"
+      - "Calico version: {{ calico_version | default('not set') }}"
+      - "Pod network CIDR: {{ pod_network_cidr | default('192.168.0.0/16') }}"
+
+  roles:
+  - role: common
+    tags: [ common, setup ]
+
+  - role: containerd
+    tags: [ containerd, runtime ]
+
+  - role: kubernetes
+    tags: [ kubernetes, k8s ]
+
+  - role: cni
+    tags: [ cni, networking ]
+
+  - role: addons
+    tags: [ addons ]
+
+  - role: tools
+    tags: [ tools ]
+
+  - role: finalize
+    tags: [ finalize ]
+
+  post_tasks:
+  - name: Verify Kubernetes cluster is running
+    command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+    register: k8s_nodes
+    changed_when: false
+    ignore_errors: yes
+
+  - name: Display Kubernetes nodes
+    debug:
+      msg: "{{ k8s_nodes.stdout_lines }}"
+    when: k8s_nodes is succeeded
+
+  - name: Check for failed pods
+    shell: |
+      kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A | grep -v Running | grep -v Completed || echo "All pods running"
+    register: failed_pods
+    changed_when: false
+    ignore_errors: yes
+
+  - name: Display failed pods
+    debug:
+      msg: "{{ failed_pods.stdout_lines }}"
+    when: failed_pods is succeeded
+
+  - name: Unmask automatic update services
+    systemd:
+      name: "{{ item }}"
+      masked: no
+    with_items:
+    - apt-daily.service
+    - apt-daily-upgrade.service
+    - unattended-upgrades.service
+    ignore_errors: yes

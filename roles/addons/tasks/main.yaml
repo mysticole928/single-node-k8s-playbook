@@ -1,0 +1,151 @@
+---
+# Kubernetes addons installation
+
+- name: Deploy Metrics Server
+  block:
+  - name: Apply Metrics Server manifests
+    kubernetes.core.k8s:
+      src: "https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ metrics_server_version }}/components.yaml"
+      state: present
+      kubeconfig: /etc/kubernetes/admin.conf
+    register: metrics_server_result
+    retries: 5
+    delay: 10
+    until: metrics_server_result is succeeded
+    become: yes
+
+  - name: Patch Metrics Server for insecure TLS
+    kubernetes.core.k8s_json_patch:
+      kind: Deployment
+      name: metrics-server
+      namespace: kube-system
+      patch:
+      - op: add
+        path: "/spec/template/spec/containers/0/args/-"
+        value: "--kubelet-insecure-tls"
+      kubeconfig: /etc/kubernetes/admin.conf
+
+  - name: Wait for metrics-server to be ready
+    shell: |
+      kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready pods -l k8s-app=metrics-server -n kube-system --timeout=300s
+    changed_when: false
+    retries: 10
+    delay: 30
+    until: metrics_server_wait.rc == 0
+    register: metrics_server_wait
+    become: yes
+    ignore_errors: yes
+
+- name: Deploy local-path storage
+  block:
+  - name: Apply local-path storage manifests
+    kubernetes.core.k8s:
+      src: "https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml"
+      state: present
+      kubeconfig: /etc/kubernetes/admin.conf
+    register: storage_result
+    retries: 5
+    delay: 10
+    until: storage_result is succeeded
+    become: yes
+
+  - name: Set local-path as default storage class
+    kubernetes.core.k8s_json_patch:
+      kind: StorageClass
+      name: local-path
+      patch:
+      - op: add
+        path: "/metadata/annotations/storageclass.kubernetes.io~1is-default-class"
+        value: "true"
+      kubeconfig: /etc/kubernetes/admin.conf
+
+- name: Deploy NGINX Ingress Controller
+  kubernetes.core.k8s:
+    src: "https://raw.githubusercontent.com/kubernetes/ingress-nginx/{{ nginx_ingress_version }}/deploy/static/provider/cloud/deploy.yaml"
+    state: present
+    kubeconfig: /etc/kubernetes/admin.conf
+  register: ingress_result
+  retries: 5
+  delay: 10
+  until: ingress_result is succeeded
+
+- name: Install Helm 3
+  block:
+  - name: Download Helm installer
+    get_url:
+      url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      dest: /tmp/get-helm-3.sh
+      mode: '0755'
+
+  - name: Run Helm installer
+    command: /tmp/get-helm-3.sh
+    args:
+      creates: /usr/local/bin/helm
+    register: helm_install
+
+  - name: Verify Helm installation
+    command: helm version --short
+    changed_when: false
+    when: helm_install.changed
+
+- name: Deploy Kubernetes Dashboard
+  block:
+  - name: Add Dashboard Helm repository
+    kubernetes.core.helm_repository:
+      name: kubernetes-dashboard
+      repo_url: https://kubernetes.github.io/dashboard
+    environment:
+      PATH: /usr/local/bin:{{ ansible_env.PATH }}
+
+  - name: Install Dashboard via Helm
+    kubernetes.core.helm:
+      release_name: kubernetes-dashboard
+      chart_ref: kubernetes-dashboard/kubernetes-dashboard
+      chart_version: "{{ dashboard_version | regex_replace('^kubernetes-dashboard-','') | regex_replace('^v','') }}"
+      release_namespace: kubernetes-dashboard
+      create_namespace: true
+      wait: true
+      wait_timeout: 600s
+      values:
+        serviceAccount:
+          create: true
+          name: admin-user
+        rbac:
+          clusterAdminRole: true
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+      PATH: /usr/local/bin:{{ ansible_env.PATH }}
+
+  - name: Retrieve Dashboard token
+    shell: kubectl -n kubernetes-dashboard create token admin-user
+    register: dashboard_token
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+    no_log: true
+
+  - name: Save Dashboard token for user
+    copy:
+      content: "{{ dashboard_token.stdout }}"
+      dest: "/home/{{ k8s_user }}/dashboard-token.txt"
+      owner: "{{ k8s_user }}"
+      group: "{{ k8s_user }}"
+      mode: '0600'
+
+- name: Configure default resource limits
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: LimitRange
+      metadata:
+        name: default-limits
+        namespace: default
+      spec:
+        limits:
+        - default:
+            cpu: 500m
+            memory: 512Mi
+          defaultRequest:
+            cpu: 200m
+            memory: 256Mi
+          type: Container
+    kubeconfig: /etc/kubernetes/admin.conf

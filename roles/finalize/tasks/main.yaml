@@ -1,0 +1,91 @@
+---
+# Finalization tasks
+
+- name: Create Quick Start Guide
+  copy:
+    dest: "/home/{{ k8s_user }}/k8s-quickstart.md"
+    owner: "{{ k8s_user }}"
+    group: "{{ k8s_user }}"
+    mode: '0644'
+    content: |-
+      # Kubernetes Quick Start Guide
+      ## Useful Commands
+      - Check node status: `kubectl get nodes`
+      - Check all pods: `kubectl get pods --all-namespaces`
+      - Access Dashboard: `kubectl proxy` then visit:
+        http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/
+      ## Dashboard Access
+      Token stored in: ~/dashboard-token.txt
+      ## Maintenance
+      - Check space: `check-space`
+      - Clean up: `k8s-cleanup`
+      ## Useful Tools
+      - k9s: Terminal UI
+      - helm: Package manager
+      - kubectl plugins: `kubectl krew list`
+      ## Common Tasks
+      1. Deploy app: `kubectl create deployment nginx --image=nginx`
+      2. Expose app: `kubectl expose deployment nginx --port=80 --type=NodePort`
+      3. Scale app: `kubectl scale deployment nginx --replicas=3`
+      ## Monitoring
+      - Resource usage: `kubectl top nodes` or `kubectl top pods`
+      - Logs: `kubectl logs <pod>`
+
+- name: Check if Kubernetes is running properly
+  command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+  register: k8s_status
+  changed_when: false
+  retries: 5
+  delay: 10
+  until: k8s_status is succeeded
+  become: yes
+
+- name: Display Kubernetes status
+  debug:
+    msg: "{{ k8s_status.stdout_lines }}"
+
+- name: Check all system pods are running
+  shell: |
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A | grep -v Running | grep -v Completed | wc -l
+  register: non_running_pods
+  changed_when: false
+  become: yes
+
+- name: Display warning if not all system pods are running
+  debug:
+    msg: "Warning: Not all system pods are running. Check 'kubectl get pods -A'"
+  when: non_running_pods.stdout | int > 0
+
+- name: Set up bash completion for kubectl
+  lineinfile:
+    path: "/home/{{ k8s_user }}/.bashrc"
+    line: 'source <(kubectl completion bash)'
+    state: present
+  become: yes
+
+- name: Create kubectl alias with completion
+  lineinfile:
+    path: "/home/{{ k8s_user }}/.bashrc"
+    line: 'alias k=kubectl && complete -o default -F __start_kubectl k'
+    state: present
+  become: yes
+
+- name: Run health check
+  command: /usr/local/bin/k8s-health-check.sh
+  changed_when: false
+
+- name: Log installation completion
+  shell: echo "Kubernetes installation completed at $(date)" | tee -a /var/log/k8s-install.log
+
+- name: Ensure atd service is running
+  service:
+    name: atd
+    state: started
+    enabled: true
+
+- name: Schedule reboot
+  at:
+    command: "shutdown -r now 'Reboot to finalize Kubernetes install'"
+    count: 1
+    units: minutes
+  when: reboot_after_install | default(true) | bool

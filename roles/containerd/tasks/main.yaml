@@ -1,0 +1,92 @@
+---
+# Containerd installation and configuration
+
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add Docker apt repository
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    filename: docker
+    state: present
+
+- name: Install containerd and Docker packages
+  apt:
+    name: "{{ containerd_packages + docker_packages }}"
+    state: present
+    update_cache: yes
+    lock_timeout: 300
+
+- name: Force remove apt locks
+  shell: |
+    rm -f /var/lib/apt/lists/lock
+    rm -f /var/lib/dpkg/lock
+    rm -f /var/lib/dpkg/lock-frontend
+    rm -f /var/cache/apt/archives/lock
+    dpkg --configure -a
+  changed_when: false
+
+- name: Install containerd dependencies
+  apt:
+    name:
+    - apt-transport-https
+    - ca-certificates
+    - curl
+    - gnupg
+    state: present
+    update_cache: yes
+    force_apt_get: yes
+  register: pkg_install
+  retries: 5
+  delay: 10
+  until: pkg_install is succeeded
+
+- name: Create containerd config directory
+  file:
+    path: /etc/containerd
+    state: directory
+    mode: '0755'
+
+- name: Generate default containerd config
+  shell: containerd config default > /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Enable systemd cgroup in containerd
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  notify: restart containerd
+
+- name: Install crictl
+  block:
+  - name: Compute crictl version from Kubernetes version
+    set_fact:
+      crictl_version: >-
+        v{{ kubernetes_version | regex_replace('^v','') | regex_search('^[0-9]+\.[0-9]+') }}.0
+
+  - name: Download crictl archive
+    get_url:
+      url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-amd64.tar.gz"
+      dest: "/tmp/crictl-{{ crictl_version }}-linux-amd64.tar.gz"
+      mode: '0644'
+
+  - name: Extract crictl binary to /usr/local/bin
+    unarchive:
+      src: "/tmp/crictl-{{ crictl_version }}-linux-amd64.tar.gz"
+      dest: /usr/local/bin
+      remote_src: yes
+      creates: /usr/local/bin/crictl
+
+  - name: Ensure crictl is executable
+    file:
+      path: /usr/local/bin/crictl
+      mode: '0755'
+
+  - name: Clean up crictl archive
+    file:
+      path: "/tmp/crictl-{{ crictl_version }}-linux-amd64.tar.gz"
+      state: absent

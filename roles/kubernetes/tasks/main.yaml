@@ -1,0 +1,255 @@
+---
+# Kubernetes installation and initialization
+
+- name: Derive "minor" version for pkgs.k8s.io path
+  set_fact:
+    k8s_minor: "{{ kubernetes_version | regex_replace('^v','') | regex_search('^[0-9]+\\.[0-9]+') }}"
+
+- name: Force remove apt locks
+  shell: |
+    rm -f /var/lib/apt/lists/lock
+    rm -f /var/lib/dpkg/lock
+    rm -f /var/lib/dpkg/lock-frontend
+    rm -f /var/cache/apt/archives/lock
+    rm -f /var/lib/dpkg/updates/*
+    rm -f /var/lib/dpkg/triggers/*
+    dpkg --configure -a
+    echo "APT locks cleared"
+  become: true
+  changed_when: false
+
+- name: Download Kubernetes APT key
+  get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/Release.key"
+    dest: /usr/share/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
+  become: yes
+
+- name: Add Kubernetes APT repository
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    mode: '0644'
+    content: |
+      deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/ /
+  become: yes
+
+- name: Refresh APT cache after adding Kubernetes repo
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+    force_apt_get: yes
+  become: yes
+
+- name: Install kubeadm, kubelet & kubectl
+  apt:
+    name:
+    - "kubeadm={{ kubernetes_version | regex_replace('^v','') }}-*"
+    - "kubelet={{ kubernetes_version | regex_replace('^v','') }}-*"
+    - "kubectl={{ kubernetes_version | regex_replace('^v','') }}-*"
+    state: present
+    update_cache: yes
+    force_apt_get: yes
+  become: yes
+  register: k8s_install
+  retries: 5
+  delay: 10
+  until: k8s_install is succeeded
+
+- name: Download static kubeadm, kubelet, kubectl as fallback
+  get_url:
+    url: "https://dl.k8s.io/{{ kubernetes_version }}/bin/linux/amd64/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: '0755'
+  loop:
+  - kubeadm
+  - kubelet
+  - kubectl
+  become: yes
+
+- name: Install etcdctl
+  block:
+  - name: Download etcdctl archive
+    get_url:
+      url: "https://github.com/etcd-io/etcd/releases/download/{{ etcd_version }}/etcd-{{ etcd_version }}-linux-amd64.tar.gz"
+      dest: "/tmp/etcd-{{ etcd_version }}-linux-amd64.tar.gz"
+      mode: '0644'
+
+  - name: Extract etcdctl
+    unarchive:
+      src: "/tmp/etcd-{{ etcd_version }}-linux-amd64.tar.gz"
+      dest: /tmp
+      remote_src: yes
+
+  - name: Install etcdctl binary
+    copy:
+      src: "/tmp/etcd-{{ etcd_version }}-linux-amd64/etcdctl"
+      dest: /usr/local/bin/etcdctl
+      mode: '0755'
+      remote_src: yes
+
+  - name: Clean up etcd files
+    file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+    - "/tmp/etcd-{{ etcd_version }}-linux-amd64.tar.gz"
+    - "/tmp/etcd-{{ etcd_version }}-linux-amd64"
+  become: yes
+
+- name: Configure kubelet systemd
+  block:
+  - name: Ensure kubelet service.d directory exists
+    file:
+      path: /etc/systemd/system/kubelet.service.d
+      state: directory
+      mode: '0755'
+
+  - name: Write kubelet systemd unit
+    copy:
+      dest: /etc/systemd/system/kubelet.service
+      mode: '0644'
+      content: |
+        [Unit]
+        Description=kubelet: The Kubernetes Node Agent
+        Documentation=https://kubernetes.io/docs/
+        After=containerd.service
+        Requires=containerd.service
+
+        [Service]
+        ExecStart=/usr/local/bin/kubelet
+        Restart=always
+        StartLimitInterval=0
+        RestartSec=10
+
+        [Install]
+        WantedBy=multi-user.target
+
+  - name: Write kubelet drop-in flags
+    copy:
+      dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+      mode: '0644'
+      content: |
+        [Service]
+        ExecStart=
+        ExecStart=/usr/local/bin/kubelet \
+          --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
+          --kubeconfig=/etc/kubernetes/kubelet.conf \
+          --config=/var/lib/kubelet/config.yaml \
+          --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
+          --pod-infra-container-image=registry.k8s.io/pause:3.10
+  notify: reload systemd
+  become: yes
+
+- name: Add node-name to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ ansible_default_ipv4.address }} {{ node_name }}"
+    state: present
+  become: yes
+
+- name: Pre-pull kubeadm images
+  command: kubeadm config images pull --kubernetes-version {{ kubernetes_version }}
+  changed_when: false
+  become: yes
+  register: image_pull
+  retries: 5
+  delay: 10
+  until: image_pull is succeeded
+
+- name: Check if Kubernetes is already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: k8s_initialized
+  become: yes
+
+- name: Initialize Kubernetes cluster
+  command: >-
+    kubeadm init
+      --kubernetes-version {{ kubernetes_version }}
+      --pod-network-cidr={{ pod_network_cidr | default('192.168.0.0/16') }}
+      --node-name={{ node_name }}
+      --cri-socket=unix:///run/containerd/containerd.sock
+  when: not k8s_initialized.stat.exists
+  register: kubeadm_init
+  become: yes
+  failed_when: false
+
+- name: Check if initialization failed
+  fail:
+    msg: "Kubernetes initialization failed: {{ kubeadm_init.stderr }}"
+  when: not k8s_initialized.stat.exists and kubeadm_init.rc != 0
+  become: yes
+
+- name: Enable kubelet on boot
+  systemd:
+    name: kubelet
+    enabled: true
+    state: started
+  become: yes
+
+- name: Set proper permissions for admin.conf
+  file:
+    path: /etc/kubernetes/admin.conf
+    mode: '0644'
+  become: yes
+  when: not k8s_initialized.stat.exists or kubeadm_init.changed
+
+- name: Wait for API server to be healthy
+  shell: |
+    for i in $(seq 1 60); do
+      kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw '/healthz' && exit 0
+      sleep 2
+    done
+    exit 1
+  register: api_wait
+  retries: 30
+  delay: 2
+  until: api_wait.rc == 0
+  changed_when: false
+  become: yes
+
+- name: Configure kubeconfig for root
+  block:
+  - file:
+      path: /root/.kube
+      state: directory
+      mode: '0755'
+  - copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /root/.kube/config
+      remote_src: yes
+      mode: '0600'
+  become: yes
+
+- name: Configure kubeconfig for user
+  block:
+  - file:
+      path: "/home/{{ k8s_user }}/.kube"
+      state: directory
+      owner: "{{ k8s_user }}"
+      group: "{{ k8s_user }}"
+      mode: '0755'
+  - copy:
+      src: /etc/kubernetes/admin.conf
+      dest: "/home/{{ k8s_user }}/.kube/config"
+      remote_src: yes
+      owner: "{{ k8s_user }}"
+      group: "{{ k8s_user }}"
+      mode: '0600'
+  become: yes
+
+- name: Set KUBECONFIG environment variable for user
+  lineinfile:
+    path: "/home/{{ k8s_user }}/.bashrc"
+    line: 'export KUBECONFIG=/home/{{ k8s_user }}/.kube/config'
+    state: present
+  become: yes
+
+- name: Remove control-plane/master taints
+  shell: |
+    kubectl taint nodes --all node-role.kubernetes.io/control-plane-  || true
+    kubectl taint nodes --all node-role.kubernetes.io/master-         || true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+  become: yes

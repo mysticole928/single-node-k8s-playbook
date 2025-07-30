@@ -1,0 +1,135 @@
+---
+# Install additional tools and utilities
+
+- name: Install Helm
+  block:
+  - name: Download Helm install script
+    get_url:
+      url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      dest: /tmp/get_helm.sh
+      mode: '0755'
+
+  - name: Run Helm install script
+    command: /tmp/get_helm.sh
+    changed_when: true
+  become: yes
+
+- name: Install kubectl plugins
+  pip:
+    name:
+    - kube-shell
+    - kubernetes-validate
+    state: present
+  become: yes
+
+- name: Install k9s
+  shell: curl -sS https://webinstall.dev/k9s | bash
+  args:
+    creates: "/home/{{ k8s_user }}/.local/bin/k9s"
+  become: yes
+  become_user: "{{ k8s_user }}"
+  become: yes
+
+- name: Extract k9s
+  unarchive:
+    src: /tmp/k9s.tar.gz
+    dest: /usr/local/bin
+    remote_src: yes
+    extra_opts: [ --strip-components=0 ]
+    include: [ k9s ]
+    mode: '0755'
+  when: k9s_download is changed
+  become: yes
+
+- name: Install krew
+  block:
+  - name: Set OS and ARCH facts
+    set_fact:
+      os_type: "{{ ansible_system | lower }}"
+      arch_type: >-
+        {{ ansible_architecture | 
+           regex_replace('x86_64', 'amd64') | 
+           regex_replace('^(arm)(64)?$', '\1\2') | 
+           regex_replace('aarch64', 'arm64') }}
+
+  - name: Download and install krew
+    shell: |
+      set -e
+      cd "$(mktemp -d)"
+      KREW="krew-{{ os_type }}_{{ arch_type }}"
+      curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/${KREW}.tar.gz"
+      tar zxvf "${KREW}.tar.gz"
+      ./${KREW} install krew
+    args:
+      creates: "/home/{{ k8s_user }}/.krew"
+    become: yes
+    become_user: "{{ k8s_user }}"
+
+- name: Create maintenance scripts
+  block:
+  - copy:
+      dest: /usr/local/bin/check-disk-space.sh
+      mode: '0755'
+      content: |-
+        #!/bin/bash
+        echo "=== Disk Space Report ==="
+        df -h /
+        echo -e "\n=== Docker Space Usage ==="
+        docker system df
+        echo -e "\n=== Largest Files ==="
+        find / -type f -size +100M -exec ls -lh {} \; 2>/dev/null | sort -rh -k5
+  - copy:
+      dest: /usr/local/bin/k8s-cleanup.sh
+      mode: '0755'
+      content: |-
+        #!/bin/bash
+        echo "Cleaning up Kubernetes resources..."
+        kubectl delete pods --field-selector status.phase=Failed --all-namespaces
+        kubectl delete pods --field-selector status.phase=Succeeded --all-namespaces
+        echo "Cleaning up Docker resources..."
+        docker system prune -f
+        echo "Cleaning up logs..."
+        journalctl --vacuum-time=3d
+        find /var/log -type f -name "*.gz" -delete
+        echo "Cleanup complete!"
+  - copy:
+      dest: /usr/local/bin/k8s-health-check.sh
+      mode: '0755'
+      content: |-
+        #!/bin/bash
+        echo "=== Kubernetes Node Status ==="
+        kubectl get nodes
+        echo -e "\n=== Kubernetes Pod Status ==="
+        kubectl get pods --all-namespaces
+        echo -e "\n=== System Status ==="
+        df -h /
+        free -h
+
+- name: Configure environment aliases
+  block:
+  - copy:
+      dest: "/home/{{ k8s_user }}/.k8s-aliases"
+      owner: "{{ k8s_user }}"
+      group: "{{ k8s_user }}"
+      mode: '0644'
+      content: |-
+        export KUBECONFIG=/home/{{ k8s_user }}/.kube/config
+        export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
+        alias k='kubectl'
+        alias kgp='kubectl get pods'
+        alias kgpa='kubectl get pods --all-namespaces'
+        alias kgn='kubectl get nodes'
+        alias kgs='kubectl get services'
+        alias kgd='kubectl get deployments'
+        alias kd='kubectl describe'
+        alias kl='kubectl logs'
+        alias ke='kubectl exec -it'
+        alias kns='kubectl config set-context --current --namespace'
+        alias check-space='/usr/local/bin/check-disk-space.sh'
+        alias k8s-cleanup='/usr/local/bin/k8s-cleanup.sh'
+        source <(kubectl completion bash)
+        complete -F __start_kubectl k
+  - lineinfile:
+      path: "/home/{{ k8s_user }}/.bashrc"
+      line: 'source ~/.k8s-aliases'
+      create: yes

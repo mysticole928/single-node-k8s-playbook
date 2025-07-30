@@ -1,0 +1,106 @@
+# roles/cni/tasks/main.yml
+---
+# CNI installation
+
+- name: Ensure Kubernetes config has correct permissions
+  file:
+    path: /etc/kubernetes/admin.conf
+    mode: '0644'
+  become: yes
+
+- name: Create .kube directory for ubuntu user
+  file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
+  become: yes
+
+- name: Copy admin.conf to ubuntu user's .kube directory
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    remote_src: yes
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+  become: yes
+
+- name: Set KUBECONFIG environment variable
+  lineinfile:
+    path: /home/ubuntu/.bashrc
+    line: 'export KUBECONFIG=/home/ubuntu/.kube/config'
+    state: present
+  become: yes
+
+- name: Check if Kubernetes API server is accessible
+  command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+  register: api_check
+  ignore_errors: yes
+  become: yes
+
+- name: Restart kubelet if API server is not accessible
+  systemd:
+    name: kubelet
+    state: restarted
+  when: api_check is failed
+  become: yes
+
+- name: Wait for API server to become accessible
+  command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+  register: api_check_after_restart
+  until: api_check_after_restart is succeeded
+  retries: 10
+  delay: 10
+  become: yes
+
+# Download Calico manifest locally first to avoid timeout issues
+- name: Download Calico manifest
+  get_url:
+    url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml"
+    dest: /tmp/calico.yaml
+    mode: '0644'
+  become: yes
+
+- name: Deploy Calico CNI
+  kubernetes.core.k8s:
+    src: /tmp/calico.yaml
+    state: present
+    kubeconfig: /etc/kubernetes/admin.conf
+  register: calico_result
+  retries: 5
+  delay: 10
+  until: calico_result is succeeded
+  become: yes
+
+- name: Wait for Calico pods to be ready
+  shell: |
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready pods -l k8s-app=calico-node -n kube-system --timeout=300s
+  register: calico_wait
+  changed_when: false
+  retries: 10
+  delay: 30
+  until: calico_wait.rc == 0
+  become: yes
+
+- name: Remove control-plane taint for single-node cluster
+  shell: |
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes --all node-role.kubernetes.io/control-plane- || true
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes --all node-role.kubernetes.io/master- || true
+  become: yes
+  changed_when: false
+
+- name: Verify node is ready
+  command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+  register: node_status
+  until: "'Ready' in node_status.stdout"
+  retries: 10
+  delay: 10
+  become: yes
+
+- name: Clean up downloaded manifest
+  file:
+    path: /tmp/calico.yaml
+    state: absent
+  become: yes
